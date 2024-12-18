@@ -1,12 +1,13 @@
 import flet as ft
 import requests
-from datetime import datetime
+import sqlite3
+from datetime import datetime, timedelta
 
-# 天気の文字列に対応するアイコンのマッピング（ご提供いただいたものを統合）
+# 天気アイコンの定義
 weather_icons = {
     "晴れ": "☀️",
     "晴": "☀️",
-    "雨": "🌧️",
+    "雨": "🌧️", 
     "大雨": "🌧️",
     "小雨": "🌦️",
     "曇り": "☁️",
@@ -17,193 +18,306 @@ weather_icons = {
     "霧": "🌫️",
     "みぞれ": "🌨️",
     "暴風雨": "🌪️",
-    # 必要に応じて他の天気も追加可能
 }
+
+# データベース初期化
+def init_db():
+    conn = sqlite3.connect('weather_forecast.db')
+    c = conn.cursor()
+    
+    # 地域テーブル
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS regions (
+            region_code TEXT PRIMARY KEY,
+            region_name TEXT NOT NULL
+        )
+    ''')
+    
+    # 都道府県テーブル
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS prefectures (
+            prefecture_code TEXT PRIMARY KEY,
+            prefecture_name TEXT NOT NULL,
+            region_code TEXT,
+            FOREIGN KEY (region_code) REFERENCES regions(region_code)
+        )
+    ''')
+    
+    # 天気予報テーブル
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS weather_forecasts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            prefecture_code TEXT,
+            area_code TEXT,
+            area_name TEXT,
+            forecast_date TEXT,
+            forecast_time TEXT,
+            weather TEXT,
+            weather_icon TEXT,
+            temperature TEXT,
+            precipitation_probability TEXT,
+            created_at TEXT,
+            FOREIGN KEY (prefecture_code) REFERENCES prefectures(prefecture_code),
+            UNIQUE(prefecture_code, area_code, forecast_date, forecast_time)
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+# 地域と都道府県データをDBに保存
+def save_area_data():
+    conn = sqlite3.connect('weather_forecast.db')
+    c = conn.cursor()
+    
+    url = "https://www.jma.go.jp/bosai/common/const/area.json"
+    response = requests.get(url)
+    area_data = response.json()
+    
+    # 地域データを保存
+    for code, info in area_data['centers'].items():
+        c.execute('INSERT OR REPLACE INTO regions (region_code, region_name) VALUES (?, ?)',
+                 (code, info['name']))
+    
+    # 都道府県データを保存
+    for code, info in area_data['offices'].items():
+        c.execute('INSERT OR REPLACE INTO prefectures (prefecture_code, prefecture_name, region_code) VALUES (?, ?, ?)',
+                 (code, info['name'], info['parent']))
+    
+    conn.commit()
+    conn.close()
+
+# 天気予報を取得する
+def get_weather_forecast(area_code):
+    url = f"https://www.jma.go.jp/bosai/forecast/data/forecast/{area_code}.json"
+    response = requests.get(url)
+    return response.json()
 
 def main(page: ft.Page):
     page.title = "日本の天気予報アプリ"
-
-    # 地域と都道府県のデータを取得
-    def get_regions_and_prefectures():
-        # area.jsonからデータを取得
-        url = "https://www.jma.go.jp/bosai/common/const/area.json"
-        response = requests.get(url)
-        area_data = response.json()
-
-        # 地方（region）のコードと名前を取得
-        regions = {}
-        for code, info in area_data['offices'].items():
-            region_code = info['parent']
-            region_name = area_data['centers'][region_code]['name']
-            prefecture_name = info['name']
-            if region_name not in regions:
-                regions[region_name] = []
-            regions[region_name].append({
-                'code': code,
-                'name': prefecture_name
-            })
-        return regions
-
-    # 天気予報を取得する
-    def get_weather_forecast(area_code):
-        url = f"https://www.jma.go.jp/bosai/forecast/data/forecast/{area_code}.json"
-        response = requests.get(url)
-        data = response.json()
-        return data
-
-    # 地方選択時に都道府県のドロップダウンを更新
-    def on_region_change(e):
-        selected_region = region_dropdown.value
-        prefecture_dropdown.options = [
-            ft.dropdown.Option(pref['name']) for pref in regions[selected_region]
-        ]
-        prefecture_dropdown.value = None  # 初期化
-        prefecture_dropdown.update()
-        # 天気情報をクリア
-        weather_info.controls.clear()
-        page.update()
-
-    # 都道府県選択時に天気情報を取得して表示
-    def display_weather(e):
-        selected_region = region_dropdown.value
-        selected_prefecture = prefecture_dropdown.value
-
-        # 選択された都道府県のコードを取得
-        for pref in regions[selected_region]:
-            if pref['name'] == selected_prefecture:
-                area_code = pref['code']
-                break
-        else:
-            return
-
-        # 天気予報データを取得
-        forecast_data = get_weather_forecast(area_code)
-
-        # エリアコードを取得（市区町村のコード）
-        area_codes = []
-
-        # 気温情報を取得するために、エリアコードを取得
-        # 今回は最初のエリアコードを使用
-        area_json = forecast_data[0]
-        time_series = area_json.get("timeSeries", [])
-        for ts in time_series:
-            areas = ts.get("areas", [])
-            for area in areas:
-                if "weathers" in area or "temps" in area or "pops" in area:
-                    area_code_temp = area["area"]["code"]
-                    area_name = area["area"]["name"]
-                    area_codes.append((area_code_temp, area_name))
-                    break
-            if area_codes:
-                break
-
-        # 天気情報を解析して表示
-        weather_info.controls.clear()
-
-        # データを格納するリスト
-        table_rows = []
-
-        # データを一時的に格納する辞書
-        data_dict = {}
-
-        # 時系列のデータをまとめる
-        for ts in forecast_data[0]["timeSeries"]:
-            timeDefines = ts["timeDefines"]
-            areas = ts["areas"]
-            for area in areas:
-                if area["area"]["code"] == area_codes[0][0]:
-                    for i, time in enumerate(timeDefines):
-                        time_fmt = datetime.fromisoformat(time).strftime("%Y-%m-%d %H:%M")
-                        if time_fmt not in data_dict:
-                            data_dict[time_fmt] = {}
-                        if "weathers" in area:
-                            weather = area["weathers"][i] if i < len(area["weathers"]) else ""
-                            # 天気アイコンを取得
-                            weather_icon = ""
-                            for key in weather_icons:
-                                if key in weather:
-                                    weather_icon = weather_icons[key]
-                                    break
-                            data_dict[time_fmt]["weather"] = weather
-                            data_dict[time_fmt]["weather_icon"] = weather_icon
-                        if "temps" in area:
-                            temp = area["temps"][i] if i < len(area["temps"]) else ""
-                            data_dict[time_fmt]["temp"] = temp
-                        if "pops" in area:
-                            pop = area["pops"][i] if i < len(area["pops"]) else ""
-                            data_dict[time_fmt]["pop"] = pop
-
-        # データをテーブルに追加
-        for time_fmt in sorted(data_dict.keys()):
-            date_str, time_str = time_fmt.split(' ')
-            weather_icon = data_dict[time_fmt].get("weather_icon", "")
-            weather = data_dict[time_fmt].get("weather", "")
-            temp = data_dict[time_fmt].get("temp", "")
-            pop = data_dict[time_fmt].get("pop", "")
-
-            table_rows.append(
-                ft.DataRow(cells=[
-                    ft.DataCell(ft.Text(date_str)),
-                    ft.DataCell(ft.Text(time_str)),
-                    ft.DataCell(ft.Text(weather_icon)),
-                    ft.DataCell(ft.Text(weather)),
-                    ft.DataCell(ft.Text(f"{temp}℃" if temp else "")),
-                    ft.DataCell(ft.Text(f"{pop}%" if pop else "")),
-                ])
-            )
-
-        # データテーブルを作成
-        data_table = ft.DataTable(
-            columns=[
-                ft.DataColumn(ft.Text("日付")),
-                ft.DataColumn(ft.Text("時刻")),
-                ft.DataColumn(ft.Text("天気")),
-                ft.DataColumn(ft.Text("詳細")),
-                ft.DataColumn(ft.Text("気温")),
-                ft.DataColumn(ft.Text("降水確率")),
-            ],
-            rows=table_rows
-        )
-
-        weather_info.controls.append(ft.Text(f"{selected_prefecture} ({area_codes[0][1]})の天気予報：", size=20, weight=ft.FontWeight.BOLD))
-        weather_info.controls.append(data_table)
-        page.update()
-
-    # 地域と都道府県のデータを取得
-    regions = get_regions_and_prefectures()
-
-    # 地域名のリスト
-    region_names = list(regions.keys())
-
-    # 地域のドロップダウンメニュー
-    region_dropdown = ft.Dropdown(
-        options=[ft.dropdown.Option(name) for name in region_names],
-        on_change=on_region_change
-    )
-
-    # 都道府県のドロップダウンメニュー
-    prefecture_dropdown = ft.Dropdown(
-        options=[],
-        on_change=display_weather
-    )
-
+    page.theme_mode = ft.ThemeMode.LIGHT
+    page.window_width = 1000
+    page.window_height = 800
     weather_info = ft.Column()
 
+    # DB初期化とエリアデータの保存
+    init_db()
+    save_area_data()
+
+    # DBから地域データを取得
+    def get_regions():
+        conn = sqlite3.connect('weather_forecast.db')
+        c = conn.cursor()
+        c.execute('SELECT DISTINCT region_name FROM regions')
+        regions = [row[0] for row in c.fetchall()]
+        conn.close()
+        return regions
+    # 天気予報をDBに保存
+    def save_weather_forecast(prefecture_code, forecast_data):
+        conn = sqlite3.connect('weather_forecast.db')
+        c = conn.cursor()
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        for area_data in forecast_data[0]["timeSeries"]:
+            timeDefines = area_data["timeDefines"]
+            areas = area_data["areas"]
+            
+            for area in areas:
+                area_code = area["area"]["code"]
+                area_name = area["area"]["name"]
+                
+                for i, time in enumerate(timeDefines):
+                    dt = datetime.fromisoformat(time)
+                    forecast_date = dt.strftime("%Y-%m-%d")
+                    forecast_time = dt.strftime("%H:%M")
+                    
+                    weather = area.get("weathers", [""])[i] if "weathers" in area else ""
+                    temp = area.get("temps", [""])[i] if "temps" in area else ""
+                    pop = area.get("pops", [""])[i] if "pops" in area else ""
+                    
+                    weather_icon = ""
+                    for key in weather_icons:
+                        if key in weather:
+                            weather_icon = weather_icons[key]
+                            break
+                    
+                    c.execute('''
+                        INSERT OR REPLACE INTO weather_forecasts 
+                        (prefecture_code, area_code, area_name, forecast_date, forecast_time,
+                         weather, weather_icon, temperature, precipitation_probability, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (prefecture_code, area_code, area_name, forecast_date, forecast_time,
+                          weather, weather_icon, temp, pop, current_time))
+        
+        conn.commit()
+        conn.close()
+
+    # 地域選択時の処理
+    def on_region_change(e):
+        conn = sqlite3.connect('weather_forecast.db')
+        c = conn.cursor()
+        c.execute('''
+            SELECT prefecture_name 
+            FROM prefectures p
+            JOIN regions r ON p.region_code = r.region_code
+            WHERE r.region_name = ?
+        ''', (region_dropdown.value,))
+        prefectures = [row[0] for row in c.fetchall()]
+        conn.close()
+
+        prefecture_dropdown.options = [
+            ft.dropdown.Option(name) for name in prefectures
+        ]
+        prefecture_dropdown.value = None
+        prefecture_dropdown.update()
+        
+        weather_info.controls.clear()
+        page.update()
+
+    # 天気予報表示の処理
+    def display_weather(e):
+        weather_info.controls.clear()
+        
+        if not prefecture_dropdown.value:
+            return
+
+        conn = sqlite3.connect('weather_forecast.db')
+        c = conn.cursor()
+        
+        c.execute('SELECT prefecture_code FROM prefectures WHERE prefecture_name = ?',
+                 (prefecture_dropdown.value,))
+        prefecture_code = c.fetchone()[0]
+        
+        try:
+            forecast_data = get_weather_forecast(prefecture_code)
+            save_weather_forecast(prefecture_code, forecast_data)
+        except Exception as e:
+            print(f"forecast data update error: {e}")
+
+        # 日付ごとにグループ化されたデータを取得
+        c.execute('''
+            SELECT DISTINCT forecast_date,
+                   MAX(CASE WHEN forecast_time LIKE '09%' THEN temperature END) as temp_min,
+                   MAX(CASE WHEN forecast_time LIKE '15%' THEN temperature END) as temp_max,
+                   MAX(weather) as weather,
+                   MAX(weather_icon) as weather_icon,
+                   MAX(area_name) as area_name,
+                   MAX(precipitation_probability) as precipitation_probability
+            FROM weather_forecasts
+            WHERE prefecture_code = ?
+            GROUP BY forecast_date
+            ORDER BY forecast_date
+            LIMIT 7
+        ''', (prefecture_code,))
+        
+        forecast_results = c.fetchall()
+        conn.close()
+
+        # カードを横に並べるための行を作成
+        forecast_row = ft.Row(
+            controls=[],
+            scroll=ft.ScrollMode.AUTO
+        )
+
+        # 各日付のカードを作成
+        for result in forecast_results:
+            forecast_date, temp_min, temp_max, weather, weather_icon, area_name, pop = result
+            
+            # 日付のフォーマット
+            date_obj = datetime.strptime(forecast_date, '%Y-%m-%d')
+            formatted_date = date_obj.strftime('%m/%d')
+            day_of_week = date_obj.strftime('%a')
+            
+            # カードの作成
+            card = ft.Card(
+                content=ft.Container(
+                    content=ft.Column(
+                        [
+                            ft.Text(f"{formatted_date} ({day_of_week})", 
+                                  size=16, 
+                                  weight=ft.FontWeight.BOLD,
+                                  text_align=ft.TextAlign.CENTER),
+                            ft.Text(weather_icon, size=40, text_align=ft.TextAlign.CENTER),
+                            ft.Text(weather, 
+                                  size=14, 
+                                  text_align=ft.TextAlign.CENTER),
+                            ft.Row(
+                                [
+                                    ft.Text(f"最低 {temp_min}℃", 
+                                          size=14, 
+                                          color=ft.colors.BLUE,
+                                          weight=ft.FontWeight.BOLD),
+                                ],
+                                alignment=ft.MainAxisAlignment.CENTER,
+                            ),
+                            ft.Row(
+                                [
+                                    ft.Text(f"最高 {temp_max}℃", 
+                                          size=14, 
+                                          color=ft.colors.RED,
+                                          weight=ft.FontWeight.BOLD),
+                                ],
+                                alignment=ft.MainAxisAlignment.CENTER,
+                            ),
+                            ft.Text(f"降水確率 {pop}%", 
+                                  size=14, 
+                                  text_align=ft.TextAlign.CENTER),
+                        ],
+                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                        spacing=10,
+                    ),
+                    padding=15,
+                    width=150,
+                )
+            )
+            forecast_row.controls.append(card)
+
+        # タイトルと予報カードを表示
+        weather_info.controls.extend([
+            ft.Text(
+                f"{prefecture_dropdown.value}の天気予報",
+                size=24,
+                weight=ft.FontWeight.BOLD,
+                text_align=ft.TextAlign.CENTER,
+            ),
+            forecast_row,
+        ])
+        
+        page.update()
+
+    # ドロップダウンメニューの作成
+    region_dropdown = ft.Dropdown(
+        width=200,
+        options=[ft.dropdown.Option(name) for name in get_regions()],
+        label="地域を選択",
+    )
+
+    prefecture_dropdown = ft.Dropdown(
+        width=200,
+        options=[],
+        label="都道府県を選択",
+    )
+
+    # イベントハンドラの設定
+    region_dropdown.on_change = on_region_change
+    prefecture_dropdown.on_change = display_weather
+
+    # レイアウトの設定
     page.add(
-        ft.Column(
-            [
-                ft.Text("地域を選択してください："),
-                region_dropdown,
-                ft.Text("都道府県を選択してください："),
-                prefecture_dropdown,
-                weather_info,
-            ],
-            alignment=ft.MainAxisAlignment.START,
-            horizontal_alignment=ft.CrossAxisAlignment.START
+        ft.Container(
+            content=ft.Column(
+                [
+                    ft.Row(
+                        [region_dropdown, prefecture_dropdown],
+                        alignment=ft.MainAxisAlignment.CENTER,
+                    ),
+                    weather_info,
+                ],
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            padding=20,
         )
     )
 
-ft.app(target=main)
-
-
-############################################
+if __name__ == '__main__':
+    ft.app(target=main)
